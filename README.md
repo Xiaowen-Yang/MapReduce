@@ -124,3 +124,20 @@ shared + write
 - Worker B 捕获下载错误，向 Coordinator 发送一个特殊的 RPC
 - Coordinator 收到报告后，将 Map 任务 X 的状态从 Completed 强制重置为 Idle
 - Coordinator 将该 Map 任务重新分配给其他存活的 Worker
+
+### 本地测试
+cd src/main
+go build -buildmode=plugin ../mrapps/wc.go
+rm mr-out*
+
+go run mrcoordinator.go pg-*.txt
+
+一个命令窗口启动worker1：
+go run mrworker.go 127.0.0.1:1234 wc.so
+跑完几个 Map 任务（屏幕显示 Map Task X completed）但还没进入 Reduce 阶段时，在终端 2 按 Ctrl+C kill
+
+一个命令窗口启动worker 2：
+go run mrworker.go 127.0.0.1:1234 wc.so
+Worker 2 会重新执行那些丢失的 Map 任务
+
+cat mr-out-* | sort | more
