@@ -143,4 +143,4 @@ Worker 2 会重新执行那些丢失的 Map 任务
 
 `cat mr-out-* | sort | more`
 
-`ssh -i ~/mr-key.pem ubuntu@xx.xx.xx.xx`
+`ssh -i ~/DS_Lab2.pem ubuntu@xx.xx.xx.xx`
