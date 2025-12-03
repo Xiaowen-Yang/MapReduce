@@ -145,5 +145,5 @@ Worker 2 会重新执行那些丢失的 Map 任务
 
 ### Cloud Test
 `ssh -i ~/DS_Lab2.pem ubuntu@xx.xx.xx.xx`
-`./mrcoordinator.go pg-*.txt`
+`./mrcoordinator pg-*.txt`
 `./mrworker coordinator_ip:1234 wc.so`
