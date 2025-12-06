@@ -78,12 +78,12 @@ cat mr-out-* | sort | more
 ## Cloud Testing
 To run on a distributed environment (e.g., AWS/Cloud VMs) where workers do not share a file system:
 
-### 1. Deploy: Copy the binary and source files to the remote machines.
-### 2. Coordinator: Start on the primary node.
+### 1. Deploy: Copy the binary and source files to the remote machines
+### 2. Coordinator: Start on the primary node
 ```bash
 ./mrcoordinator pg-*.txt
 ```
-### 3. Workers: Start on worker nodes, pointing to the Coordinator's IP.
+### 3. Workers: Start on worker nodes, pointing to the Coordinator's IP
 ```bash
 ./mrworker <COORDINATOR_IP>:1234 wc.so
 ```
