@@ -97,6 +97,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	term = rf.currentTerm
+	isleader = rf.state == Leader
+	rf.mu.Unlock()
+
 	return term, isleader
 }
 
@@ -168,6 +173,45 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+	}
+
+	reply.Term = rf.currentTerm
+
+	// Grant Vote
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpdateLog(args) {
+		rf.state = Follower
+		rf.lastHeartbeat = time.Now()
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+	} else {
+		reply.VoteGranted = false
+	}
+}
+
+// Determine whether the log of the candidate is the latest.
+func (rf *Raft) isUpdateLog(args *RequestVoteArgs) bool {
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
+
+	if args.LastLogTerm > lastLogTerm {
+		return true
+	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
+		return true
+	}
+	return false
 }
 
 type AppendEntriesArgs struct {
@@ -182,6 +226,46 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // CurrentTerm, for leader to update itself
 	Success bool // True if follower contained entry matching PrevLogIndex and PrevLogTerm
+}
+
+// 1. Reply false if term < currentTerm (§5.1)
+// 2. Reply false if log doesn’t contain an entry at prevLogIndex
+// whose term matches prevLogTerm (§5.3)
+// 3. If an existing entry conflicts with a new one (same index
+// but different terms), delete the existing entry and all that
+// follow it (§5.3)
+// 4. Append any new entries not already in the log
+// 5. If leaderCommit > commitIndex, set commitIndex =
+// min(leaderCommit, index of last new entry)
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// Update the follower's lastHeartbeat to prevent it from timing out and becoming a candidate
+	rf.currentTerm = args.Term
+	rf.state = Follower
+	rf.lastHeartbeat = time.Now()
+
+	// Consistency Check
+	// Does our log have the entry at PrevLogIndex?
+	// And does the term match PrevLogTerm?
+	if args.PrevLogIndex > len(rf.log) {
+		reply.Success = false
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	// Conflict Resolution
+	reply.Success = true
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -213,6 +297,11 @@ type AppendEntriesReply struct {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -257,16 +346,160 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) broadcastHeartbeat() {
+	rf.mu.Lock()
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+
+	// 1. Constructing heartbeat parameters
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
+
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: lastLogIndex,
+		PrevLogTerm:  lastLogTerm,
+		Entries:      nil, // There is no log entry in heartbeat
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+
+	// 2. Send heartbeats to all Followers in parallel
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			reply := &AppendEntriesReply{}
+			if rf.sendAppendEntries(server, args, reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// Check if our status has changed after the RPC response
+				// If we are no longer the Leader, or our term has changed, ignore this response
+				if rf.state != Leader || rf.currentTerm != args.Term {
+					return
+				}
+
+				// 3. Handle Request
+				// Step down to follower if find a higher term
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.state = Follower
+					rf.votedFor = -1
+					rf.persist()
+					return
+				}
+
+				// 2A 阶段我们主要关注心跳维持权威，
+				// 暂时不需要处理 reply.Success 为 false 的日志不一致情况（那是 2B 的内容）。
+			}
+		}(peer)
+	}
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	rf.state = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.lastHeartbeat = time.Now()
+	rf.persist()
+
+	term := rf.currentTerm
+	me := rf.me
+
+	args := &RequestVoteArgs{
+		Term:         term,
+		CandidateId:  me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+	}
+	rf.mu.Unlock() // // Unlock after constructing parameters to allow other RPCs to process
+
+	// Counting votes, initially vote for myself
+	var votes int32 = 1
+
+	for peer := range rf.peers {
+		if peer == me {
+			continue
+		}
+
+		go func(server int) {
+			reply := &RequestVoteReply{}
+			if rf.sendRequestVote(server, args, reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// Check if our status has changed after the RPC response
+				if rf.currentTerm != term || rf.state != Candidate {
+					return
+				}
+
+				// Step down to follower if find a higher term
+				if reply.Term > term {
+					rf.currentTerm = reply.Term
+					rf.state = Follower
+					rf.votedFor = -1
+					rf.persist()
+					return
+				}
+
+				// Counting votes
+				if reply.VoteGranted {
+					// Atomize the vote count to avoid concurrent conflicts
+					currentVotes := atomic.AddInt32(&votes, 1)
+
+					if int(currentVotes) > len(rf.peers)/2 {
+						// win and become a leader
+						if rf.state == Candidate {
+							rf.state = Leader
+							rf.persist()
+							go rf.broadcastHeartbeat()
+						}
+					}
+				}
+			}
+		}(peer)
+	}
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
-		// Your code here (2A)
-		// Check if a leader election should be started.
+		// 1. Check if it is a Leader
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		if state == Leader {
+			// If it is a leader, send heartbeat
+			rf.broadcastHeartbeat()
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			// 2. If it is a  Follower or Candidate，run timeout detection
+			// Generate random timeout, 400 ms- 800 ms
+			ms := 400 + (rand.Int63() % 400)
+			electionTimeout := time.Duration(ms) * time.Millisecond
+			// Sleep wait
+			time.Sleep(electionTimeout)
+			rf.mu.Lock()
+
+			// 3. Check timeout
+			if rf.state != Leader && time.Since(rf.lastHeartbeat) >= electionTimeout {
+				// If the person is not the leader and the timeout has expired, an election will be held.
+				rf.mu.Unlock()
+				// To avoid deadlock in startElection, we should unlock before call this function
+				rf.startElection()
+			} else {
+				// If there is no timeout, or if you become the Leader, unlock normally.
+				rf.mu.Unlock()
+			}
+		}
 	}
 }
 
