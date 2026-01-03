@@ -88,6 +88,10 @@ type Raft struct {
 	// Volatile state on all leader
 	nextIndex  []int // For each server, index of the next log entry to send to that server
 	matchIndex []int // For each server, index of highest log entry known to be replicated on server
+
+	//2B
+	applyCh   chan ApplyMsg // Used to send to the test program
+	applyCond *sync.Cond    // Used to wake up the applier
 }
 
 // return currentTerm and whether this server
@@ -103,6 +107,33 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Unlock()
 
 	return term, isleader
+}
+
+// Once a new log entry is detected that has changed to a "Committed" status,
+// these commands are immediately packaged and sent to the upper-layer application for execution
+func (rf *Raft) applier() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+
+		// If application logs are not needed, release the lock and sleep
+		// Only wake up when commitIndex > lastApplied
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+
+		rf.lastApplied++
+		// fmt.Printf("[Apply] Server %d applying index %d\n", rf.me, rf.lastApplied)
+		commitIndex := rf.lastApplied
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[commitIndex].Command,
+			CommandIndex: commitIndex,
+		}
+		rf.mu.Unlock()
+
+		// Send to channel
+		rf.applyCh <- msg
+	}
 }
 
 // save Raft's persistent state to stable storage,
@@ -241,6 +272,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 1. Check Term
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -252,20 +284,61 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.state = Follower
 	rf.lastHeartbeat = time.Now()
 
-	// Consistency Check
-	// Does our log have the entry at PrevLogIndex?
-	// And does the term match PrevLogTerm?
-	if args.PrevLogIndex > len(rf.log) {
+	// 2. Consistency Check
+	// fmt.Printf("S%d Recv AppendEntries: PrevLogIndex=%d, MyLogLen=%d\n", rf.me, args.PrevLogIndex, len(rf.log))
+
+	// Case A: The Follower's log doesn't contain an entry at PrevLogIndex
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
-		return
-	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
+		reply.Term = rf.currentTerm
 		return
 	}
 
-	// Conflict Resolution
+	// Case B: The Follower's log contains an entry at PrevLogIndex whose term does't match PrevLogTerm
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// 3. The check passed, it means that PrevLogIndex was consistent before
 	reply.Success = true
+	reply.Term = rf.currentTerm
+
+	// 4. Conflicts resolution
+	// Iterate through args.Entries, starting from args.PrevLogIndex + 1
+	for i, entry := range args.Entries {
+		index := args.PrevLogIndex + 1 + i
+
+		if index < len(rf.log) {
+			// If the position index already contains logs, check for conflicts
+			if rf.log[index].Term != entry.Term {
+				// Conflicts. Delete the existing entry and all that follow it
+				rf.log = rf.log[:index]
+				// Append new log entries
+				rf.log = append(rf.log, entry)
+			}
+		} else {
+			// If there is no log, append directly
+			rf.log = append(rf.log, entry)
+		}
+	}
+
+	// If the log changes, persist
+	rf.persist()
+
+	// 5. Update CommitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		// commitIndex = min(LeaderCommit, Index of Last New Entry)
+		// Last New Entry is the last log of the Follower
+		if args.LeaderCommit > len(rf.log)-1 {
+			rf.commitIndex = len(rf.log) - 1
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+		// Wake up applier
+		rf.applyCond.Broadcast()
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -323,6 +396,27 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 1. Only a leader can start prcessing a command
+	if rf.state != Leader {
+		return index, term, false
+	}
+
+	// 2. Construct the LogEntry
+	entry := LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+
+	// 3. Append to the local log
+	rf.log = append(rf.log, entry)
+
+	index = len(rf.log) - 1
+	term = rf.currentTerm
+	// fmt.Printf("[Start] Leader %d got cmd at index %d term %d\n", rf.me, index, term)
+	go rf.broadcastHeartbeat()
 
 	return index, term, isLeader
 }
@@ -353,40 +447,63 @@ func (rf *Raft) broadcastHeartbeat() {
 		return
 	}
 
-	// 1. Constructing heartbeat parameters
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
-
-	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: lastLogIndex,
-		PrevLogTerm:  lastLogTerm,
-		Entries:      nil, // There is no log entry in heartbeat
-		LeaderCommit: rf.commitIndex,
-	}
+	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
 
-	// 2. Send heartbeats to all Followers in parallel
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 
 		go func(server int) {
+			rf.mu.Lock()
+			// Check status before sending:
+			// If it is no longer the Leader or the Term has changed, stop
+			if rf.state != Leader || rf.currentTerm != currentTerm {
+				rf.mu.Unlock()
+				return
+			}
+
+			// 1. Construct parameters for this Follower
+
+			// Calculate the index of the previous log entry
+			prevLogIndex := rf.nextIndex[server] - 1
+
+			// Boundary protection: Prevents boundary crossings
+			if prevLogIndex < 0 {
+				prevLogIndex = 0
+			}
+
+			// Retrieve the Term of the previous log entry
+			prevLogTerm := rf.log[prevLogIndex].Term
+
+			// Prepare the log entries to send, from nextIndex to the last
+			entries := make([]LogEntry, len(rf.log)-(prevLogIndex+1))
+			copy(entries, rf.log[prevLogIndex+1:])
+			// fmt.Printf("Leader %d -> S%d: PrevLogIndex=%d, EntriesLen=%d\n", rf.me, server, prevLogIndex, len(entries))
+
+			args := &AppendEntriesArgs{
+				Term:         currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+
+			// 2. Send RPC
 			reply := &AppendEntriesReply{}
 			if rf.sendAppendEntries(server, args, reply) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 
-				// Check if our status has changed after the RPC response
-				// If we are no longer the Leader, or our term has changed, ignore this response
-				if rf.state != Leader || rf.currentTerm != args.Term {
+				// Check the status again after the RPC returns
+				if rf.state != Leader || rf.currentTerm != currentTerm {
 					return
 				}
 
-				// 3. Handle Request
-				// Step down to follower if find a higher term
+				// Handling Term Changes
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
@@ -395,8 +512,26 @@ func (rf *Raft) broadcastHeartbeat() {
 					return
 				}
 
-				// 2A 阶段我们主要关注心跳维持权威，
-				// 暂时不需要处理 reply.Success 为 false 的日志不一致情况（那是 2B 的内容）。
+				// 3. Process log replication results
+				if reply.Success {
+					newMatchIndex := args.PrevLogIndex + len(args.Entries)
+					// fmt.Printf("Leader %d <- S%d: Success! Update matchIndex to %d\n", rf.me, server, newMatchIndex)
+					if newMatchIndex > rf.matchIndex[server] {
+						rf.matchIndex[server] = newMatchIndex
+						rf.nextIndex[server] = rf.matchIndex[server] + 1
+					}
+					// Check if a new log can be submitted.
+					rf.leaderCommitRule()
+				} else {
+					// Failure: Log inconsistency
+					// Simple backtracking logic: decrement by 1 and retry
+					// fmt.Printf("Leader %d <- S%d: Rejected (PrevLogIndex=%d). Decrementing nextIndex.\n", rf.me, server, args.PrevLogIndex)
+					rf.nextIndex[server]--
+					// Boundary check: Cannot be less than 1
+					if rf.nextIndex[server] < 1 {
+						rf.nextIndex[server] = 1
+					}
+				}
 			}
 		}(peer)
 	}
@@ -419,7 +554,7 @@ func (rf *Raft) startElection() {
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
-	rf.mu.Unlock() // // Unlock after constructing parameters to allow other RPCs to process
+	rf.mu.Unlock() // Unlock after constructing parameters to allow other RPCs to process
 
 	// Counting votes, initially vote for myself
 	var votes int32 = 1
@@ -458,6 +593,15 @@ func (rf *Raft) startElection() {
 						// win and become a leader
 						if rf.state == Candidate {
 							rf.state = Leader
+							// Initialize the Leader's volatile state
+							rf.nextIndex = make([]int, len(rf.peers))
+							rf.matchIndex = make([]int, len(rf.peers))
+							for i := range rf.peers {
+								// The initial value of nextIndex is the last log index of the Leader + 1
+								rf.nextIndex[i] = len(rf.log)
+								// The initial value of matchIndex is 0
+								rf.matchIndex[i] = 0
+							}
 							rf.persist()
 							go rf.broadcastHeartbeat()
 						}
@@ -468,38 +612,80 @@ func (rf *Raft) startElection() {
 	}
 }
 
+// Check if commitIndex can be advanced
+func (rf *Raft) leaderCommitRule() {
+	if rf.state != Leader {
+		return
+	}
+
+	// Algorithm: Find an N such that N > commitIndex, and for most matchesIndex[i] >= N, and log[N].Term == currentTerm
+
+	// Start trying from commitIndex + 1 and continue until the end of the log
+	for N := rf.commitIndex + 1; N < len(rf.log); N++ {
+		if rf.log[N].Term != rf.currentTerm {
+			continue
+		}
+
+		count := 1
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= N {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = N
+			// Wake up applier
+			// fmt.Printf("[Commit] Leader %d updated commitIndex to %d\n", rf.me, rf.commitIndex)
+			rf.applyCond.Broadcast()
+		}
+	}
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
-		// 1. Check if it is a Leader
+		// 1. Check state
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
 
+		// 2. Action based on state
 		if state == Leader {
-			// If it is a leader, send heartbeat
+			// Leader Logic: Send heartbeats periodically
 			rf.broadcastHeartbeat()
 			time.Sleep(100 * time.Millisecond)
 		} else {
-			// 2. If it is a  Follower or Candidate，run timeout detection
-			// Generate random timeout, 400 ms- 800 ms
-			ms := 400 + (rand.Int63() % 400)
-			electionTimeout := time.Duration(ms) * time.Millisecond
-			// Sleep wait
-			time.Sleep(electionTimeout)
-			rf.mu.Lock()
+			// Follower/Candidate Logic: Election Timeout
 
-			// 3. Check timeout
-			if rf.state != Leader && time.Since(rf.lastHeartbeat) >= electionTimeout {
-				// If the person is not the leader and the timeout has expired, an election will be held.
+			// Generate random timeout (300-600ms)
+			ms := 300 + (rand.Int63() % 300)
+			electionTimeout := time.Duration(ms) * time.Millisecond
+			startTime := time.Now()
+
+			// Sleep in short intervals to remain responsive
+			for time.Since(startTime) < electionTimeout {
+				rf.mu.Lock()
+				// If we become Leader or are killed, stop waiting immediately
+				if rf.state == Leader || rf.killed() {
+					rf.mu.Unlock()
+					goto EndOfLoop // Break out of the sleep loop, but stay in ticker
+				}
 				rf.mu.Unlock()
-				// To avoid deadlock in startElection, we should unlock before call this function
-				rf.startElection()
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// Timeout expired, check if we should start election
+			rf.mu.Lock()
+			// Must verify timeout again with lastHeartbeat because a heartbeat
+			// might have arrived while we were sleeping in the loop above.
+			if rf.state != Leader && time.Since(rf.lastHeartbeat) >= electionTimeout {
+				rf.mu.Unlock()
+				rf.startElection() // startElection handles its own locking
 			} else {
-				// If there is no timeout, or if you become the Leader, unlock normally.
 				rf.mu.Unlock()
 			}
 		}
+	EndOfLoop:
 	}
 }
 
@@ -526,11 +712,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeartbeat = time.Now()
 	rf.log = append(rf.log, LogEntry{Term: 0}) // log starts at Index 1
 
+	// 2B
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.applier()
 	return rf
 }
