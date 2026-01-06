@@ -33,7 +33,7 @@ Workers are long-running processes that request tasks from the Coordinator via R
 ### 3. RPC Communication
 - Protocol: Uses **TCP** (instead of Unix Domain Sockets) to allow execution across different machines.
 - Worker → Coordinator: asks for tasks; reports task completion (sending Task ID and Type).
-- Coordinator → Worker: assigns tasks (sending Task ID, Type, Filename, `nReduce`, or Map worker address list)
+- Coordinator → Worker: assigns tasks (sending Task ID, Type, Filename, `nReduce`, or Map worker address list).
 
 ---
 
